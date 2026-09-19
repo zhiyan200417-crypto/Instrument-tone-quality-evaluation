@@ -5,8 +5,15 @@ import torch.nn.functional as F
 from models.asma_crnn_model import SimplifiedBiGSSM1D
 
 
-class AF_ASMA_CRNN_ADSR_Encoder(nn.Module):
-    """
+class AMSSM_Encoder(nn.Module):
+    """AMSSM 编码器：ASMA-CRNN-ADSR + K 维声学描述符门控加法。
+
+    在 ASMA_CRNN_ADSR_Encoder 的基础上，于 Cross-Attention + FFN
+    输出之后、BiGRU 之前，通过分段对齐的帧级门控加法注入声学描述符。
+
+    除声学注入外，其余结构（共享 CNN、段类型嵌入、SSM 富化、Router、
+    Cross-Attention + FFN、BiGRU、时间池化）与 ASMA_CRNN_ADSR_Encoder
+    完全一致，保证消融对比的唯一变量就是声学注入本身。
 
     参数
     ----
@@ -31,7 +38,7 @@ class AF_ASMA_CRNN_ADSR_Encoder(nn.Module):
 
     示例
     ----
-    >>> encoder = AF_ASMA_CRNN_ADSR_Encoder(n_mels=80, acoustic_dim=16)
+    >>> encoder = AMSSM_Encoder(n_mels=80, acoustic_dim=16)
     >>> mel_ad = torch.randn(4, 18, 80)
     >>> mel_s  = torch.randn(4, 210, 80)
     >>> mel_r  = torch.randn(4, 26, 80)
@@ -338,7 +345,7 @@ class AF_ASMA_CRNN_ADSR_Encoder(nn.Module):
     def get_gate_stats(self):
         """提取融合门控、SSM 记忆衰减、段类型嵌入和声学门控的统计值。
 
-        用于训练过程中的权重日志记录。
+        用于训练过程中的权重日志记录。与 ASMA_CRNN_ADSR_Encoder 版本相比，
         额外返回 acoustic_gate 标量门控的 sigmoid 值，反映声学描述符注入强度
         的学习演化。train.py 的 CSV 日志会自动检测并记录该字段。
 
