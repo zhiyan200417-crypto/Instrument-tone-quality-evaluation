@@ -1,117 +1,3 @@
-"""
-AF-ASMA-CRNN-ADSR 编码器：在 ASMA-CRNN-ADSR 基础上注入互补声学描述符。
-
-核心改进
---------
-在 ASMA_CRNN_ADSR_Encoder（ASMA-CRNN-ADSR）的「三段 Mel → 共享 CNN →
-段类型嵌入 → 帧拼接 → SSM 富化 + Router 门控 → Cross-Attention + FFN
-→ BiGRU → 时间池化」架构上，通过 **门控加法（gated addition）** 注入
-预计算的分段帧级声学描述符。
-acoustic_dim 参数（即论文中的 K）由离线维度扫描决定，默认 K=16。
-
-与 AF-ASMA-CRNN（models/asma_acoustic_model.py）的功能对等关系
------------------------------------------------------------------
-  AF-ASMA-CRNN:      Mel → CNN → 投影 → SSM富化+Router → LN
-                                                          → (+声学)
-                                                          → BiGRU → 池化
-  AF-ASMA-CRNN-ADSR: 三段 Mel → CNN → 投影 → 段嵌入 → 拼接
-                     → SSM 富化+Router → LN → Cross-Attention+FFN
-                                                          → (+声学)
-                                                          → BiGRU → 池化
-
-  两者的声学注入位置遵循同一原则：**紧邻主时序建模器（BiGRU）的输入端**。
-    - AF-ASMA-CRNN 中声学注入在 enrichment_norm 之后、BiGRU 之前；
-    - AF-ASMA-CRNN-ADSR 中声学注入在 Cross-Attention+FFN 之后、BiGRU 之前。
-
-注入位置的设计依据
-------------------
-声学描述符注入在 Cross-Attention + FFN（分辨率协调器）之后、BiGRU 之前。
-此设计基于以下论证：
-
-  1. Cross-Attention 已完成分辨率协调，输出序列已消除 AD/S/R 段间的
-     时间步长跳变，声学注入作用于"平滑"序列上
-  2. 声学信号直接进入主时序建模器（BiGRU），无中间 LayerNorm 阻隔，
-     与 AF-ASMA-CRNN 功能对等
-  3. SSM 富化分支不受声学干扰，保持辅助时序记忆增强的职能纯净性
-  4. Router 仍基于纯 Mel 特征统计量做路由决策，语义一致
-
-声学描述符来源
---------------
-由 ``precompute_acoustic_candidates.py`` 离线提取的 115 维候选池
-经全局 per-feature mean-std 归一化，再由
-``precompute_acoustic_segments_from_candidates.py`` 按 ADSR 边界裁剪为
-三段并选取 K 维最优子集，保存为 ``{basename}_ac_ad.pt / _ac_s.pt / _ac_r.pt``。
-
-训练时由 ``train.py`` 的 ``PrecomputedMelAcousticADSRPipeline`` 加载，
-分别传入模型的 ``ac_ad``, ``ac_s``, ``ac_r`` 参数。
-
-设计要点
---------
-1. **分段对齐注入**：各段声学描述符在模型内通过 ``adaptive_avg_pool1d``
-   对齐到各自 CNN 输出的帧数，然后拼接，确保时间维精确对应。
-
-2. **单一全局门控**：使用 1 个可学习标量门控，初始化为 -2
-   （sigmoid(-2)≈0.12）。配合 warm-start 使用 —— backbone 已预训练稳定，
-   12% 的初始声学贡献既不会造成灾难性遗忘，又保证门控有足够梯度。
-
-3. **双重归一化保障**：预计算阶段已做全局 per-feature mean-std 归一化；
-   模型内的 LayerNorm 作为安全网，消除 batch 内残余分布偏移。
-
-4. **参数命名约定（硬性要求）**：三个新增组件的名字都必须包含
-   ``acoustic``。``train.py`` 依赖这一约定：
-     - warm-start 用 ``"acoustic" not in k`` 决定哪些权重加载；
-     - 微调第一阶段用 ``"acoustic" in name`` 决定哪些参数解冻；
-     - 微调第二阶段用它划分差异化学习率的参数组。
-
-5. **参数增量极小**：K=16 时新增 16×256+256（proj）+ 32（LN）+ 1（gate）
-   ≈ 4.4K 参数，相对 ASMA-CRNN-ADSR 的 ~1.63M 增幅约 0.27%。
-
-整体架构（默认配置）
---------------------
-::
-
-    三段输入 mel_ad, mel_s, mel_r + 声学 ac_ad, ac_s, ac_r
-        │
-        ▼
-    共享 CNN (段特异性池化) → 展平 + 共享 Linear(1280→256)
-        │
-        ▼
-    段类型嵌入 (AD=0, S=1, R=2)
-        │
-        ▼
-    ★帧级拼接★: cat[x_ad, x_s, x_r] → [B, T_total, 256]
-        │
-        ├─── SSM 富化分支 + DropPath ──────────────────────┐
-        │                                                   │
-        ├─── Content-Adaptive Router ─────────────────────┤
-        │                                                   │
-        ▼                                                   ▼
-    x_enriched = x_proj + gate ⊙ h_ssm
-        │
-        ▼
-    LayerNorm(256)
-        │
-        ▼
-    ★Cross-Attention(256, 4 heads) + 残差 + LN★
-        │
-        ▼
-    ★FFN(256→512→256) + 残差 + LN★
-        │
-        ▼
-    ★声学注入★: 分段 pool → cat → LN → proj → gate → 加法
-        │
-        ▼
-    2 层 BiGRU (input=256, hidden=128) → [B, T_total, 256]
-        │
-        ▼
-    时间均值池化 → [B, 256]
-
-参考模型
---------
-- models/asma_crnn_adsr_model.py : ASMA_CRNN_ADSR_Encoder（本模型的基础架构）
-- models/asma_acoustic_model.py  : ASMAAcousticEncoder（声学注入的设计参考）
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -120,14 +6,7 @@ from models.asma_crnn_model import SimplifiedBiGSSM1D
 
 
 class AF_ASMA_CRNN_ADSR_Encoder(nn.Module):
-    """AF-ASMA-CRNN-ADSR 编码器：ASMA-CRNN-ADSR + K 维声学描述符门控加法。
-
-    在 ASMA_CRNN_ADSR_Encoder 的基础上，于 Cross-Attention + FFN
-    输出之后、BiGRU 之前，通过分段对齐的帧级门控加法注入声学描述符。
-
-    除声学注入外，其余结构（共享 CNN、段类型嵌入、SSM 富化、Router、
-    Cross-Attention + FFN、BiGRU、时间池化）与 ASMA_CRNN_ADSR_Encoder
-    完全一致，保证消融对比的唯一变量就是声学注入本身。
+    """
 
     参数
     ----
@@ -459,7 +338,7 @@ class AF_ASMA_CRNN_ADSR_Encoder(nn.Module):
     def get_gate_stats(self):
         """提取融合门控、SSM 记忆衰减、段类型嵌入和声学门控的统计值。
 
-        用于训练过程中的权重日志记录。与 ASMA_CRNN_ADSR_Encoder 版本相比，
+        用于训练过程中的权重日志记录。
         额外返回 acoustic_gate 标量门控的 sigmoid 值，反映声学描述符注入强度
         的学习演化。train.py 的 CSV 日志会自动检测并记录该字段。
 
